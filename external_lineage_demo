@@ -1,0 +1,481 @@
+/* 
+================================================================================
+SNOWFLAKE EXTERNAL LINEAGE DEMO SCRIPT
+Using OpenLineage Standards
+================================================================================
+
+This script demonstrates how to set up and use External Lineage in Snowflake
+to track data flows from external systems (ETL tools, source databases) into
+Snowflake using the OpenLineage standard.
+
+PREREQUISITES:
+- Snowflake Enterprise Edition or higher
+- Account admin privileges to grant INGEST LINEAGE
+================================================================================
+*/
+
+-- ============================================================================
+-- PART 1: SETUP - Create demo objects and grant privileges
+-- ============================================================================
+
+USE ROLE ACCOUNTADMIN;
+
+-- Create a demo database and schema
+CREATE DATABASE IF NOT EXISTS EXTERNAL_LINEAGE_DEMO;
+CREATE SCHEMA IF NOT EXISTS EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA;
+
+USE DATABASE EXTERNAL_LINEAGE_DEMO;
+USE SCHEMA LINEAGE_SCHEMA;
+
+-- Create demo tables that will be targets of external lineage
+CREATE OR REPLACE TABLE CUSTOMER_DATA (
+    customer_id INT,
+    customer_name VARCHAR(100),
+    email VARCHAR(100),
+    created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE ORDER_DATA (
+    order_id INT,
+    customer_id INT,
+    order_date DATE,
+    total_amount DECIMAL(10,2),
+    status VARCHAR(20)
+);
+
+CREATE OR REPLACE TABLE PRODUCT_DATA (
+    product_id INT,
+    product_name VARCHAR(100),
+    category VARCHAR(50),
+    price DECIMAL(10,2)
+);
+
+-- Insert sample data
+INSERT INTO CUSTOMER_DATA (customer_id, customer_name, email) VALUES
+    (1, 'John Smith', 'john.smith@example.com'),
+    (2, 'Jane Doe', 'jane.doe@example.com'),
+    (3, 'Bob Wilson', 'bob.wilson@example.com');
+
+INSERT INTO ORDER_DATA (order_id, customer_id, order_date, total_amount, status) VALUES
+    (101, 1, '2024-01-15', 250.00, 'COMPLETED'),
+    (102, 2, '2024-01-16', 175.50, 'COMPLETED'),
+    (103, 1, '2024-01-17', 320.00, 'PENDING');
+
+INSERT INTO PRODUCT_DATA (product_id, product_name, category, price) VALUES
+    (1001, 'Laptop', 'Electronics', 999.99),
+    (1002, 'Keyboard', 'Electronics', 79.99),
+    (1003, 'Office Chair', 'Furniture', 299.99);
+
+-- ============================================================================
+-- PART 2: Create role and grant INGEST LINEAGE privilege
+-- ============================================================================
+
+-- Create a dedicated role for external lineage integration
+CREATE ROLE IF NOT EXISTS EXTERNAL_LINEAGE_ROLE;
+
+-- Grant the required privilege to ingest lineage events
+GRANT INGEST LINEAGE ON ACCOUNT TO ROLE EXTERNAL_LINEAGE_ROLE;
+
+-- Create a service user for external lineage integration (e.g., for dbt, Airflow)
+CREATE USER IF NOT EXISTS LINEAGE_SERVICE_USER
+    PASSWORD = 'ChangeMe123!'
+    DEFAULT_ROLE = EXTERNAL_LINEAGE_ROLE
+    MUST_CHANGE_PASSWORD = FALSE;
+
+-- Grant the role to the service user
+GRANT ROLE EXTERNAL_LINEAGE_ROLE TO USER LINEAGE_SERVICE_USER;
+
+-- Grant usage on database/schema for the lineage role
+GRANT USAGE ON DATABASE EXTERNAL_LINEAGE_DEMO TO ROLE EXTERNAL_LINEAGE_ROLE;
+GRANT USAGE ON SCHEMA EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA TO ROLE EXTERNAL_LINEAGE_ROLE;
+GRANT SELECT ON ALL TABLES IN SCHEMA EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA TO ROLE EXTERNAL_LINEAGE_ROLE;
+
+-- ============================================================================
+-- PART 3: Create role and grant DELETE LINEAGE privilege (for cleanup)
+-- ============================================================================
+
+-- Grant DELETE LINEAGE privilege for removing lineage events
+GRANT DELETE LINEAGE ON ACCOUNT TO ROLE EXTERNAL_LINEAGE_ROLE;
+
+-- ============================================================================
+-- PART 4: OpenLineage JSON Payload Examples
+-- ============================================================================
+
+/*
+The following are example JSON payloads that conform to the OpenLineage 
+specification. These would be sent to the Snowflake external lineage endpoint:
+
+ENDPOINT: POST https://<account_identifier>.snowflakecomputing.com/api/v2/lineage/external-lineage
+
+--------------------------------------------------------------------------------
+EXAMPLE 1: PostgreSQL source -> Snowflake target
+Scenario: ETL job extracts customer data from PostgreSQL and loads to Snowflake
+--------------------------------------------------------------------------------
+*/
+
+-- Example payload (to be sent via REST API, shown here for reference):
+/*
+{
+    "eventType": "COMPLETE",
+    "eventTime": "2024-01-20T10:30:00.000Z",
+    "job": {
+        "namespace": "airflow://my-airflow-instance",
+        "name": "etl_customer_data_job"
+    },
+    "run": {
+        "runId": "550e8400-e29b-41d4-a716-446655440001"
+    },
+    "producer": "https://github.com/OpenLineage/OpenLineage/blob/v1-0-0/client",
+    "schemaURL": "https://openlineage.io/spec/0-0-1/OpenLineage.json",
+    "inputs": [
+        {
+            "namespace": "postgres://source-db.company.com:5432",
+            "name": "production.public.customers",
+            "facets": {
+                "datasetType": {"datasetType": "TABLE"}
+            }
+        }
+    ],
+    "outputs": [
+        {
+            "namespace": "snowflake://<YOUR_ACCOUNT_IDENTIFIER>",
+            "name": "EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.CUSTOMER_DATA"
+        }
+    ]
+}
+*/
+
+/*
+--------------------------------------------------------------------------------
+EXAMPLE 2: Multiple sources -> Single Snowflake target
+Scenario: dbt model combines data from MySQL and S3 into Snowflake
+--------------------------------------------------------------------------------
+*/
+/*
+{
+    "eventType": "COMPLETE",
+    "eventTime": "2024-01-20T11:00:00.000Z",
+    "job": {
+        "namespace": "dbt://my-dbt-project",
+        "name": "transform_orders_model"
+    },
+    "run": {
+        "runId": "550e8400-e29b-41d4-a716-446655440002"
+    },
+    "producer": "https://github.com/OpenLineage/OpenLineage/blob/v1-0-0/client",
+    "schemaURL": "https://openlineage.io/spec/0-0-1/OpenLineage.json",
+    "inputs": [
+        {
+            "namespace": "mysql://orders-db.company.com:3306",
+            "name": "orders_db.orders",
+            "facets": {
+                "datasetType": {"datasetType": "TABLE"}
+            }
+        },
+        {
+            "namespace": "s3://company-data-lake",
+            "name": "raw/order_details/",
+            "facets": {
+                "datasetType": {"datasetType": "DATASET"}
+            }
+        }
+    ],
+    "outputs": [
+        {
+            "namespace": "snowflake://<YOUR_ACCOUNT_IDENTIFIER>",
+            "name": "EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.ORDER_DATA"
+        }
+    ]
+}
+*/
+
+/*
+--------------------------------------------------------------------------------
+EXAMPLE 3: Snowflake source -> External target (e.g., BI tool export)
+Scenario: Data exported from Snowflake to an external analytics platform
+--------------------------------------------------------------------------------
+*/
+/*
+{
+    "eventType": "COMPLETE",
+    "eventTime": "2024-01-20T12:00:00.000Z",
+    "job": {
+        "namespace": "airflow://analytics-pipeline",
+        "name": "export_to_tableau"
+    },
+    "run": {
+        "runId": "550e8400-e29b-41d4-a716-446655440003"
+    },
+    "producer": "https://github.com/OpenLineage/OpenLineage/blob/v1-0-0/client",
+    "schemaURL": "https://openlineage.io/spec/0-0-1/OpenLineage.json",
+    "inputs": [
+        {
+            "namespace": "snowflake://<YOUR_ACCOUNT_IDENTIFIER>",
+            "name": "EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.ORDER_DATA"
+        }
+    ],
+    "outputs": [
+        {
+            "namespace": "tableau://analytics.company.com",
+            "name": "Sales_Dashboard.Order_Analysis",
+            "facets": {
+                "datasetType": {"datasetType": "VIEW"}
+            }
+        }
+    ]
+}
+*/
+
+-- ============================================================================
+-- PART 5: Shell Script to Send OpenLineage Events via cURL
+-- ============================================================================
+
+/*
+Save the following as 'send_lineage_event.sh' and run from terminal:
+
+#!/bin/bash
+
+# Configuration - Replace with your values
+ACCOUNT_IDENTIFIER="YOUR_ORG-YOUR_ACCOUNT"
+JWT_TOKEN="YOUR_JWT_TOKEN_HERE"
+
+# Send OpenLineage event to Snowflake
+curl -i -X POST \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${JWT_TOKEN}" \
+  -H "Accept: application/json" \
+  -H "User-Agent: ExternalLineageDemo/1.0" \
+  -H "X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT" \
+  -d '{
+    "eventType": "COMPLETE",
+    "eventTime": "'$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")'",
+    "job": {
+        "namespace": "demo://external-lineage-test",
+        "name": "test_lineage_job"
+    },
+    "run": {
+        "runId": "'$(uuidgen)'"
+    },
+    "producer": "https://github.com/OpenLineage/OpenLineage/blob/v1-0-0/client",
+    "schemaURL": "https://openlineage.io/spec/0-0-1/OpenLineage.json",
+    "inputs": [
+        {
+            "namespace": "postgres://demo-source.example.com:5432",
+            "name": "demo_db.public.source_table",
+            "facets": {
+                "datasetType": {"datasetType": "TABLE"}
+            }
+        }
+    ],
+    "outputs": [
+        {
+            "namespace": "snowflake://'${ACCOUNT_IDENTIFIER}'",
+            "name": "EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.CUSTOMER_DATA"
+        }
+    ]
+  }' \
+  "https://${ACCOUNT_IDENTIFIER}.snowflakecomputing.com/api/v2/lineage/external-lineage"
+*/
+
+-- ============================================================================
+-- PART 6: Python Script to Send OpenLineage Events
+-- ============================================================================
+
+/*
+Save as 'send_lineage_event.py':
+
+import requests
+import json
+import uuid
+from datetime import datetime, timezone
+
+# Configuration
+ACCOUNT_IDENTIFIER = "YOUR_ORG-YOUR_ACCOUNT"
+JWT_TOKEN = "YOUR_JWT_TOKEN_HERE"
+
+def send_openlineage_event(inputs, outputs, job_name, job_namespace):
+    """Send an OpenLineage COMPLETE event to Snowflake external lineage endpoint."""
+    
+    url = f"https://{ACCOUNT_IDENTIFIER}.snowflakecomputing.com/api/v2/lineage/external-lineage"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {JWT_TOKEN}",
+        "Accept": "application/json",
+        "User-Agent": "ExternalLineageDemo/1.0",
+        "X-Snowflake-Authorization-Token-Type": "KEYPAIR_JWT"
+    }
+    
+    payload = {
+        "eventType": "COMPLETE",
+        "eventTime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "job": {
+            "namespace": job_namespace,
+            "name": job_name
+        },
+        "run": {
+            "runId": str(uuid.uuid4())
+        },
+        "producer": "https://github.com/OpenLineage/OpenLineage/blob/v1-0-0/client",
+        "schemaURL": "https://openlineage.io/spec/0-0-1/OpenLineage.json",
+        "inputs": inputs,
+        "outputs": outputs
+    }
+    
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    return response
+
+# Example: External PostgreSQL -> Snowflake
+inputs = [
+    {
+        "namespace": "postgres://source-db.company.com:5432",
+        "name": "production.public.customers",
+        "facets": {"datasetType": {"datasetType": "TABLE"}}
+    }
+]
+
+outputs = [
+    {
+        "namespace": f"snowflake://{ACCOUNT_IDENTIFIER}",
+        "name": "EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.CUSTOMER_DATA"
+    }
+]
+
+response = send_openlineage_event(
+    inputs=inputs,
+    outputs=outputs,
+    job_name="etl_customer_sync",
+    job_namespace="airflow://production-etl"
+)
+
+print(f"Status: {response.status_code}")
+print(f"Response: {response.text}")
+*/
+
+-- ============================================================================
+-- PART 7: dbt Configuration for External Lineage
+-- ============================================================================
+
+/*
+To configure dbt to emit OpenLineage events to Snowflake:
+
+1. Install the OpenLineage-dbt integration:
+   pip install openlineage-dbt
+
+2. Create openlineage.yml in your dbt project root:
+
+transport:
+  type: http
+  url: https://YOUR_ORG-YOUR_ACCOUNT.snowflakecomputing.com
+  endpoint: /api/v2/lineage/external-lineage
+  auth:
+    type: api_key
+    apiKey: YOUR_JWT_TOKEN_HERE
+  compression: gzip
+
+3. Replace 'dbt' commands with 'dbt-ol':
+   dbt-ol run
+   dbt-ol build
+   dbt-ol test
+*/
+
+-- ============================================================================
+-- PART 8: Apache Airflow Configuration for External Lineage
+-- ============================================================================
+
+/*
+To configure Apache Airflow to emit OpenLineage events to Snowflake:
+
+1. Install the OpenLineage Airflow provider:
+   pip install apache-airflow-providers-openlineage
+
+2. Set environment variables or update airflow.cfg:
+
+[openlineage]
+transport = {"type": "http", "url": "https://YOUR_ORG-YOUR_ACCOUNT.snowflakecomputing.com", "endpoint": "/api/v2/lineage/external-lineage", "auth": {"type": "api_key", "apiKey": "YOUR_JWT_TOKEN"}}
+namespace = airflow://my-airflow-instance
+
+3. OpenLineage events will be emitted automatically for supported operators.
+*/
+
+-- ============================================================================
+-- PART 9: Delete External Lineage Events (Cleanup)
+-- ============================================================================
+
+/*
+To remove external lineage between objects, send a DELETE request:
+
+DELETE https://<account_identifier>.snowflakecomputing.com/api/v2/lineage/external-lineage
+  ?sourceNamespace=postgres://source-db.company.com:5432
+  &sourceName=production.public.customers
+  &sourceDatasetType=TABLE
+  &targetNamespace=snowflake://<account_identifier>
+  &targetName=EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.CUSTOMER_DATA
+  &targetDatasetType=External%20Node
+
+Example cURL command:
+
+curl -X DELETE \
+  -H "Authorization: Bearer ${JWT_TOKEN}" \
+  -H "X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT" \
+  "https://${ACCOUNT_IDENTIFIER}.snowflakecomputing.com/api/v2/lineage/external-lineage?sourceNamespace=postgres://source-db.company.com:5432&sourceName=production.public.customers&sourceDatasetType=TABLE&targetNamespace=snowflake://${ACCOUNT_IDENTIFIER}&targetName=EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.CUSTOMER_DATA&targetDatasetType=External%20Node"
+*/
+
+-- ============================================================================
+-- PART 10: Verify Setup and View Lineage
+-- ============================================================================
+
+-- Check the role has the required privileges
+SHOW GRANTS TO ROLE EXTERNAL_LINEAGE_ROLE;
+
+-- Check the user has the role
+SHOW GRANTS TO USER LINEAGE_SERVICE_USER;
+
+-- View tables in the demo schema
+SELECT 
+    TABLE_CATALOG,
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    TABLE_TYPE,
+    ROW_COUNT,
+    CREATED
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = 'LINEAGE_SCHEMA';
+
+/*
+================================================================================
+TO VIEW EXTERNAL LINEAGE IN SNOWSIGHT:
+================================================================================
+
+1. Sign in to Snowsight
+2. Navigate to: Catalog » Database Explorer
+3. Select a table (e.g., EXTERNAL_LINEAGE_DEMO.LINEAGE_SCHEMA.CUSTOMER_DATA)
+4. Click the "Lineage" tab
+5. External objects will appear labeled as "External Node"
+
+================================================================================
+IMPORTANT NOTES:
+================================================================================
+
+1. OpenLineage Version: Snowflake supports OpenLineage v1, not v2
+2. Event Types: Only COMPLETE events are recognized; others are ignored
+3. Retention: External lineage events are retained for 1 year
+4. Limit: Maximum 10,000 events per account
+5. Latency: Events may take a few minutes to appear in Snowsight
+6. Column Lineage: External lineage does not support column-level lineage
+7. Name Length: Fully qualified dataset names cannot exceed 1000 characters
+
+================================================================================
+*/
+
+-- ============================================================================
+-- CLEANUP (Optional)
+-- ============================================================================
+
+/*
+-- To clean up the demo, run the following commands:
+
+DROP DATABASE IF EXISTS EXTERNAL_LINEAGE_DEMO;
+DROP ROLE IF EXISTS EXTERNAL_LINEAGE_ROLE;
+DROP USER IF EXISTS LINEAGE_SERVICE_USER;
+*/
